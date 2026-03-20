@@ -105,7 +105,8 @@ function Invoke-LLMCodeReview {
 
         Write-Host "[Invoke-LLMCodeReview] Extracting diffs for batch $($b + 1)..."
         [string] $changes = Get-CodeChanges -SourceBranch $SourceBranch -TargetBranch $TargetBranch -Files $batch | Out-String
-        Write-Host "Code changes to review:`n$changes"
+        $changesSizeKB = [math]::Round($changes.Length / 1024, 1)
+        Write-Host "[Invoke-LLMCodeReview] Diff size for batch $($b + 1): ${changesSizeKB} KB ($($changes.Length) chars)"
 
         Write-Host "[Invoke-LLMCodeReview] Sending batch $($b + 1)/$totalBatches to $ModelName..." -ForegroundColor Yellow
         $batchStopwatch = [System.Diagnostics.Stopwatch]::StartNew()
@@ -142,7 +143,7 @@ function Invoke-LLMCodeReview {
                     schema = $schema
                 }
             }
-        } | ConvertTo-Json -Depth 99
+        } | ConvertTo-Json -Depth 10
 
         $payloadSizeKB = [math]::Round($body.Length / 1024, 1)
         Write-Host "[Invoke-LLMCodeReview] Payload size: ${payloadSizeKB} KB ($($body.Length) chars)" -ForegroundColor Yellow
@@ -168,10 +169,11 @@ function Invoke-LLMCodeReview {
         $batchStopwatch.Stop()
         $modelUsed = if ($ModelName -eq "model-router") { $response.model } else { $ModelName }
         Write-Host "[Invoke-LLMCodeReview] Batch $($b + 1) completed in $([math]::Round($batchStopwatch.Elapsed.TotalSeconds, 1))s (model: $modelUsed)" -ForegroundColor Green
-        Write-Host "Response:"
-        Write-Host ($response.choices.message.content | ConvertTo-Json)
 
-        $batchResult = $response.choices.message.content | ConvertFrom-Json
+        $responseContent = $response.choices.message.content
+        Write-Host "[Invoke-LLMCodeReview] Response size: $($responseContent.Length) chars"
+
+        $batchResult = $responseContent | ConvertFrom-Json
         if ($batchResult.reviews) {
             $allReviews += $batchResult.reviews
             Write-Host "[Invoke-LLMCodeReview] Batch $($b + 1) returned $($batchResult.reviews.Count) reviews"
