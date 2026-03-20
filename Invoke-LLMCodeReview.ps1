@@ -101,6 +101,7 @@ function Invoke-LLMCodeReview {
     }
 
     $allReviews = @()
+    $successfulBatches = 0
 
     for ($b = 0; $b -lt $totalBatches; $b++) {
         $batch = $batches[$b]
@@ -131,43 +132,65 @@ function Invoke-LLMCodeReview {
         }
 
         try {
-            $response = Invoke-RestMethod `
+            $webResponse = Invoke-WebRequest `
                 -Uri $ModelDeploymentUrl `
                 -Headers $headers `
                 -Body ([System.Text.Encoding]::UTF8.GetBytes($body)) `
                 -Method Post `
                 -ContentType 'application/json; charset=utf-8' `
-                -TimeoutSec $TimeoutSec
+                -TimeoutSec $TimeoutSec `
+                -UseBasicParsing
         }
         catch {
-            Write-Warning "[Invoke-LLMCodeReview] Batch $($b + 1) FAILED after $([math]::Round($batchStopwatch.Elapsed.TotalSeconds, 1))s: $_"
-            Write-Warning "[Invoke-LLMCodeReview] Skipping batch $($b + 1), continuing with next batch..."
+            $statusCode = $null
+            $errorBody = $null
+            if ($_.Exception.Response) {
+                $statusCode = [int]$_.Exception.Response.StatusCode
+                try {
+                    $errorStream = $_.Exception.Response.GetResponseStream()
+                    $reader = New-Object System.IO.StreamReader($errorStream)
+                    $errorBody = $reader.ReadToEnd()
+                    $reader.Close()
+                } catch {}
+            }
+            $elapsed = [math]::Round($batchStopwatch.Elapsed.TotalSeconds, 1)
+            Write-Warning "[Invoke-LLMCodeReview] Batch $($b + 1) FAILED after ${elapsed}s - HTTP $statusCode"
+            if ($errorBody) {
+                $truncated = if ($errorBody.Length -gt 1000) { $errorBody.Substring(0, 1000) + '...[truncated]' } else { $errorBody }
+                Write-Warning "[Invoke-LLMCodeReview] Error body: $truncated"
+            } else {
+                Write-Warning "[Invoke-LLMCodeReview] Exception: $_"
+            }
             continue
         }
 
         $batchStopwatch.Stop()
-        Write-Host "[Invoke-LLMCodeReview] Batch $($b + 1) completed in $([math]::Round($batchStopwatch.Elapsed.TotalSeconds, 1))s" -ForegroundColor Green
+        $httpStatus = $webResponse.StatusCode
+        $rawBody = $webResponse.Content
+        Write-Host "[Invoke-LLMCodeReview] Batch $($b + 1) completed in $([math]::Round($batchStopwatch.Elapsed.TotalSeconds, 1))s - HTTP $httpStatus" -ForegroundColor Green
 
-        # Debug: log the raw response structure
-        Write-Host "[Invoke-LLMCodeReview] Response type: $($response.GetType().FullName)"
-        $responseKeys = if ($response -is [System.Collections.IDictionary]) { $response.Keys -join ', ' } elseif ($response.PSObject) { ($response.PSObject.Properties | Select-Object -ExpandProperty Name) -join ', ' } else { 'unknown' }
-        Write-Host "[Invoke-LLMCodeReview] Response keys: $responseKeys"
-
-        # Safely navigate the response - handle both object and dictionary access patterns
-        $choices = $null
-        if ($response.choices) { $choices = $response.choices }
-        if (-not $choices) {
-            # Log what we got so we can debug
-            $rawResponse = $response | ConvertTo-Json -Depth 5 -Compress
-            if ($rawResponse.Length -gt 2000) { $rawResponse = $rawResponse.Substring(0, 2000) + '...[truncated]' }
-            Write-Warning "[Invoke-LLMCodeReview] Batch $($b + 1) - unexpected response structure: $rawResponse"
+        if (-not $rawBody -or $rawBody.Trim().Length -eq 0) {
+            Write-Warning "[Invoke-LLMCodeReview] Batch $($b + 1) - empty response body from API"
             continue
         }
 
-        $firstChoice = if ($choices -is [array]) { $choices[0] } else { $choices }
-        $responseContent = $firstChoice.message.content
+        $response = $rawBody | ConvertFrom-Json
+
+        # Check for API error response
+        if ($response.error) {
+            Write-Warning "[Invoke-LLMCodeReview] Batch $($b + 1) - API error: $($response.error.message) (code: $($response.error.code))"
+            continue
+        }
+
+        if (-not $response.choices -or $response.choices.Count -eq 0) {
+            $truncated = if ($rawBody.Length -gt 1000) { $rawBody.Substring(0, 1000) + '...[truncated]' } else { $rawBody }
+            Write-Warning "[Invoke-LLMCodeReview] Batch $($b + 1) - no choices in response: $truncated"
+            continue
+        }
+
+        $responseContent = $response.choices[0].message.content
         if (-not $responseContent) {
-            Write-Warning "[Invoke-LLMCodeReview] Batch $($b + 1) returned empty content -- skipping"
+            Write-Warning "[Invoke-LLMCodeReview] Batch $($b + 1) - empty content in choices[0]"
             continue
         }
 
@@ -175,6 +198,7 @@ function Invoke-LLMCodeReview {
         Write-Host "[Invoke-LLMCodeReview] Model: $modelUsed | Response size: $($responseContent.Length) chars"
 
         $batchResult = $responseContent | ConvertFrom-Json
+        $successfulBatches++
         if ($batchResult.reviews) {
             $allReviews += $batchResult.reviews
             Write-Host "[Invoke-LLMCodeReview] Batch $($b + 1) returned $($batchResult.reviews.Count) reviews"
@@ -189,6 +213,11 @@ function Invoke-LLMCodeReview {
     Write-Host "========================================" -ForegroundColor Magenta
 
     $aggregated = @{ reviews = @($allReviews) } | ConvertTo-Json -Depth 10
-    Write-Host "[Invoke-LLMCodeReview] Total reviews collected: $($allReviews.Count) from $totalBatches batches" -ForegroundColor Green
+    Write-Host "[Invoke-LLMCodeReview] Total reviews collected: $($allReviews.Count) from $successfulBatches/$totalBatches successful batches" -ForegroundColor Green
+
+    if ($successfulBatches -eq 0) {
+        throw "[Invoke-LLMCodeReview] All $totalBatches batches failed. No LLM responses received. Check the warnings above for details."
+    }
+
     return $aggregated
 }
