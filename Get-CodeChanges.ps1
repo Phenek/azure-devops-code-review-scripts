@@ -10,10 +10,16 @@ function Get-ChangedFileList {
         [string[]]$FileExtensionExcludes = @('.designer.cs')
     )
 
+    Write-Host "`n[Get-ChangedFileList] Discovering changed files..." -ForegroundColor Cyan
+    Write-Host "[Get-ChangedFileList] Source: $SourceBranch | Target: $TargetBranch" -ForegroundColor Cyan
+    Write-Host "[Get-ChangedFileList] Allowed extensions: $($FileExtensions -join ', ')" -ForegroundColor Cyan
+    Write-Host "[Get-ChangedFileList] Excluded patterns: $($FileExtensionExcludes -join ', ')" -ForegroundColor Cyan
+
     $renamedSourceBranch = $SourceBranch -replace 'refs/heads/', 'origin/'
     $renamedTargetBranch = $TargetBranch -replace 'refs/heads/', 'origin/'
 
     $changedFiles = git diff --name-only --diff-filter=AM "$renamedTargetBranch...$renamedSourceBranch"
+    Write-Host "[Get-ChangedFileList] Raw files from git diff: $(@($changedFiles).Count)"
 
     $changedFiles = $changedFiles | Where-Object {
         $file = $_
@@ -22,7 +28,8 @@ function Get-ChangedFileList {
         $included -and -not $excluded
     }
 
-    Write-Host "Files after filtering: $($changedFiles.Count)"
+    Write-Host "[Get-ChangedFileList] Files after filtering: $($changedFiles.Count)" -ForegroundColor Green
+    foreach ($f in $changedFiles) { Write-Host "  - $f" }
     return @($changedFiles)
 }
 
@@ -37,14 +44,18 @@ function Get-CodeChanges {
         [string[]]$Files
     )
 
+    Write-Host "`n[Get-CodeChanges] Building diff output..." -ForegroundColor Cyan
+
     $renamedSourceBranch = $SourceBranch -replace 'refs/heads/', 'origin/'
     $renamedTargetBranch = $TargetBranch -replace 'refs/heads/', 'origin/'
 
     # Use provided file list, or discover all changed files (backward-compatible)
     if ($Files) {
         $changedFiles = $Files
+        Write-Host "[Get-CodeChanges] Using provided file list ($($changedFiles.Count) file(s))"
     } else {
         $changedFiles = Get-ChangedFileList -TargetBranch $TargetBranch -SourceBranch $SourceBranch
+        Write-Host "[Get-CodeChanges] Discovered $($changedFiles.Count) file(s)"
     }
 
     # Add legend for diff markers
@@ -60,8 +71,10 @@ function Get-CodeChanges {
 
 "@
 
+    $fileIndex = 0
     foreach ($file in $changedFiles) {
-        Write-Host "Processing: $file"
+        $fileIndex++
+        Write-Host "[Get-CodeChanges] [$fileIndex/$($changedFiles.Count)] Extracting diff for: $file"
 
         # Ensure file path starts with / for full path from repository root
         $fullPath = if ($file.StartsWith('/')) { $file } else { "/$file" }
@@ -140,5 +153,6 @@ function Get-CodeChanges {
         $llmOutput += "`n---`n"
     }
 
+    Write-Host "[Get-CodeChanges] Diff output ready ($($llmOutput.Length) chars)" -ForegroundColor Green
     return $llmOutput
 }

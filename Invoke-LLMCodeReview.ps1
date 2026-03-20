@@ -59,11 +59,15 @@ function Invoke-LLMCodeReview {
         additionalProperties = $false
     }
 
-    # Get the full list of changed files
+    Write-Host "`n========================================" -ForegroundColor Magenta
+    Write-Host "[Invoke-LLMCodeReview] STEP 1/3 - Discovering changed files" -ForegroundColor Magenta
+    Write-Host "========================================" -ForegroundColor Magenta
+    Write-Host "[Invoke-LLMCodeReview] Model: $ModelName | BatchSize: $BatchSize"
+
     $allFiles = Get-ChangedFileList -SourceBranch $SourceBranch -TargetBranch $TargetBranch
 
     if ($allFiles.Count -eq 0) {
-        Write-Host "No changed files to review."
+        Write-Host "[Invoke-LLMCodeReview] No changed files to review." -ForegroundColor Yellow
         return '{"reviews":[]}'
     }
 
@@ -75,7 +79,11 @@ function Invoke-LLMCodeReview {
     }
 
     $totalBatches = $batches.Count
-    Write-Host "Processing $($allFiles.Count) file(s) in $totalBatches batch(es) of up to $BatchSize"
+
+    Write-Host "`n========================================" -ForegroundColor Magenta
+    Write-Host "[Invoke-LLMCodeReview] STEP 2/3 - Sending batches to LLM" -ForegroundColor Magenta
+    Write-Host "========================================" -ForegroundColor Magenta
+    Write-Host "[Invoke-LLMCodeReview] $($allFiles.Count) file(s) -> $totalBatches batch(es) of up to $BatchSize"
 
     # System prompt — loaded once, reused for every batch
     $systemPrompt = Get-Content -Path $PathToReviewFile -Raw
@@ -91,8 +99,12 @@ function Invoke-LLMCodeReview {
         $batch = $batches[$b]
         Write-Host "`n--- Batch $($b + 1)/$totalBatches ($($batch.Count) file(s): $($batch -join ', ')) ---" -ForegroundColor Cyan
 
+        Write-Host "[Invoke-LLMCodeReview] Extracting diffs for batch $($b + 1)..."
         [string] $changes = Get-CodeChanges -SourceBranch $SourceBranch -TargetBranch $TargetBranch -Files $batch | Out-String
         Write-Host "Code changes to review:`n$changes"
+
+        Write-Host "[Invoke-LLMCodeReview] Sending batch $($b + 1)/$totalBatches to $ModelName..." -ForegroundColor Yellow
+        $batchStopwatch = [System.Diagnostics.Stopwatch]::StartNew()
 
         $messages = @(
             @{
@@ -135,18 +147,27 @@ function Invoke-LLMCodeReview {
             -Method Post `
             -ContentType 'application/json'
 
+        $batchStopwatch.Stop()
         $modelUsed = if ($ModelName -eq "model-router") { $response.model } else { $ModelName }
-        Write-Host "Response from $($modelUsed):"
+        Write-Host "[Invoke-LLMCodeReview] Batch $($b + 1) completed in $([math]::Round($batchStopwatch.Elapsed.TotalSeconds, 1))s (model: $modelUsed)" -ForegroundColor Green
+        Write-Host "Response:"
         Write-Host ($response.choices.message.content | ConvertTo-Json)
 
         $batchResult = $response.choices.message.content | ConvertFrom-Json
         if ($batchResult.reviews) {
             $allReviews += $batchResult.reviews
+            Write-Host "[Invoke-LLMCodeReview] Batch $($b + 1) returned $($batchResult.reviews.Count) review(s)"
+        } else {
+            Write-Host "[Invoke-LLMCodeReview] Batch $($b + 1) returned 0 reviews"
         }
     }
 
     # Aggregate all reviews into a single JSON output
+    Write-Host "`n========================================" -ForegroundColor Magenta
+    Write-Host "[Invoke-LLMCodeReview] STEP 3/3 - Aggregating results" -ForegroundColor Magenta
+    Write-Host "========================================" -ForegroundColor Magenta
+
     $aggregated = @{ reviews = @($allReviews) } | ConvertTo-Json -Depth 10
-    Write-Host "`nTotal reviews collected: $($allReviews.Count)" -ForegroundColor Green
+    Write-Host "[Invoke-LLMCodeReview] Total reviews collected: $($allReviews.Count) from $totalBatches batch(es)" -ForegroundColor Green
     return $aggregated
 }
