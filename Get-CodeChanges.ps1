@@ -1,14 +1,51 @@
-function Get-CodeChanges {
+function Get-ChangedFileList {
     param (
+        [parameter(Mandatory)]
         [string]$TargetBranch,
-        [string]$SourceBranch
+
+        [parameter(Mandatory)]
+        [string]$SourceBranch,
+
+        [string[]]$FileExtensions = @('.cs', '.ts', '.tsx', '.js', '.jsx', '.dart', '.json', '.yaml', '.yml'),
+        [string[]]$FileExtensionExcludes = @('.designer.cs')
     )
 
     $renamedSourceBranch = $SourceBranch -replace 'refs/heads/', 'origin/'
     $renamedTargetBranch = $TargetBranch -replace 'refs/heads/', 'origin/'
 
-    # Get changed code files only
     $changedFiles = git diff --name-only --diff-filter=AM "$renamedTargetBranch...$renamedSourceBranch"
+
+    $changedFiles = $changedFiles | Where-Object {
+        $file = $_
+        $included = $FileExtensions | Where-Object { $file.EndsWith($_) }
+        $excluded = $FileExtensionExcludes | Where-Object { $file.EndsWith($_) }
+        $included -and -not $excluded
+    }
+
+    Write-Host "Files after filtering: $($changedFiles.Count)"
+    return @($changedFiles)
+}
+
+function Get-CodeChanges {
+    param (
+        [parameter(Mandatory)]
+        [string]$TargetBranch,
+
+        [parameter(Mandatory)]
+        [string]$SourceBranch,
+
+        [string[]]$Files
+    )
+
+    $renamedSourceBranch = $SourceBranch -replace 'refs/heads/', 'origin/'
+    $renamedTargetBranch = $TargetBranch -replace 'refs/heads/', 'origin/'
+
+    # Use provided file list, or discover all changed files (backward-compatible)
+    if ($Files) {
+        $changedFiles = $Files
+    } else {
+        $changedFiles = Get-ChangedFileList -TargetBranch $TargetBranch -SourceBranch $SourceBranch
+    }
 
     # Add legend for diff markers
     $llmOutput = @"

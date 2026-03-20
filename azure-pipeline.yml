@@ -29,7 +29,8 @@ steps:
         -PathToReviewFile './Generic.reviewpromtpfile.md' `
         -ModelName 'gpt-5.1-chat' `
         -ModelDeploymentUrl 'https://<Microsoft Foundry Instance>.cognitiveservices.azure.com/openai/deployments/gpt-5.1-chat/chat/completions?api-version=2025-01-01-preview' `
-        -Key $(foundry-key)
+        -Key $(foundry-key) `
+        -BatchSize 5
 
       Set-PullRequestComments `
         -Organization ("$(System.CollectionUri)" -split "/" | Select-Object -index 3) `
