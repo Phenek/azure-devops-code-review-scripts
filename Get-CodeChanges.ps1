@@ -52,10 +52,10 @@ function Get-CodeChanges {
     # Use provided file list, or discover all changed files (backward-compatible)
     if ($Files) {
         $changedFiles = $Files
-        Write-Host "[Get-CodeChanges] Using provided file list ($($changedFiles.Count) file(s))"
+        Write-Host "[Get-CodeChanges] Using provided file list - $($changedFiles.Count) files"
     } else {
         $changedFiles = Get-ChangedFileList -TargetBranch $TargetBranch -SourceBranch $SourceBranch
-        Write-Host "[Get-CodeChanges] Discovered $($changedFiles.Count) file(s)"
+        Write-Host "[Get-CodeChanges] Discovered $($changedFiles.Count) files"
     }
 
     # Add legend for diff markers
