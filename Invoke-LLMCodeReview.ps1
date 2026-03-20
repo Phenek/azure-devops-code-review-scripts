@@ -146,15 +146,33 @@ function Invoke-LLMCodeReview {
         }
 
         $batchStopwatch.Stop()
-        $modelUsed = if ($ModelName -eq "model-router") { $response.model } else { $ModelName }
-        Write-Host "[Invoke-LLMCodeReview] Batch $($b + 1) completed in $([math]::Round($batchStopwatch.Elapsed.TotalSeconds, 1))s (model: $modelUsed)" -ForegroundColor Green
+        Write-Host "[Invoke-LLMCodeReview] Batch $($b + 1) completed in $([math]::Round($batchStopwatch.Elapsed.TotalSeconds, 1))s" -ForegroundColor Green
 
-        $responseContent = $response.choices[0].message.content
-        if (-not $responseContent) {
-            Write-Warning "[Invoke-LLMCodeReview] Batch $($b + 1) returned empty response -- skipping"
+        # Debug: log the raw response structure
+        Write-Host "[Invoke-LLMCodeReview] Response type: $($response.GetType().FullName)"
+        $responseKeys = if ($response -is [System.Collections.IDictionary]) { $response.Keys -join ', ' } elseif ($response.PSObject) { ($response.PSObject.Properties | Select-Object -ExpandProperty Name) -join ', ' } else { 'unknown' }
+        Write-Host "[Invoke-LLMCodeReview] Response keys: $responseKeys"
+
+        # Safely navigate the response - handle both object and dictionary access patterns
+        $choices = $null
+        if ($response.choices) { $choices = $response.choices }
+        if (-not $choices) {
+            # Log what we got so we can debug
+            $rawResponse = $response | ConvertTo-Json -Depth 5 -Compress
+            if ($rawResponse.Length -gt 2000) { $rawResponse = $rawResponse.Substring(0, 2000) + '...[truncated]' }
+            Write-Warning "[Invoke-LLMCodeReview] Batch $($b + 1) - unexpected response structure: $rawResponse"
             continue
         }
-        Write-Host "[Invoke-LLMCodeReview] Response size: $($responseContent.Length) chars"
+
+        $firstChoice = if ($choices -is [array]) { $choices[0] } else { $choices }
+        $responseContent = $firstChoice.message.content
+        if (-not $responseContent) {
+            Write-Warning "[Invoke-LLMCodeReview] Batch $($b + 1) returned empty content -- skipping"
+            continue
+        }
+
+        $modelUsed = if ($response.model) { $response.model } else { $ModelName }
+        Write-Host "[Invoke-LLMCodeReview] Model: $modelUsed | Response size: $($responseContent.Length) chars"
 
         $batchResult = $responseContent | ConvertFrom-Json
         if ($batchResult.reviews) {
