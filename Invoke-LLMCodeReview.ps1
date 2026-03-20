@@ -89,6 +89,9 @@ function Invoke-LLMCodeReview {
     Write-Host "========================================" -ForegroundColor Magenta
     Write-Host "[Invoke-LLMCodeReview] $($allFiles.Count) files -> $totalBatches batches of up to $BatchSize"
 
+    # Pre-serialize the schema once (small static structure, safe with ConvertTo-Json)
+    $schemaJson = $schema | ConvertTo-Json -Depth 10 -Compress
+
     # System prompt — loaded once, reused for every batch
     $systemPrompt = Get-Content -Path $PathToReviewFile -Raw
 
@@ -111,39 +114,15 @@ function Invoke-LLMCodeReview {
         Write-Host "[Invoke-LLMCodeReview] Sending batch $($b + 1)/$totalBatches to $ModelName..." -ForegroundColor Yellow
         $batchStopwatch = [System.Diagnostics.Stopwatch]::StartNew()
 
-        $messages = @(
-            @{
-                role    = 'system'
-                content = @(
-                    @{
-                        type = "text"
-                        text = $systemPrompt
-                    }
-                )
-            },
-            @{
-                role    = 'user'
-                content = @(
-                    @{
-                        type = "text"
-                        text = $changes
-                    }
-                )
-            }
-        )
+        # Build JSON body manually to avoid ConvertTo-Json depth explosion on complex nested objects
+        # Each string is serialized individually (safe, produces properly escaped JSON strings)
+        $modelJson = $ModelName | ConvertTo-Json
+        $promptJson = $systemPrompt | ConvertTo-Json
+        $changesJson = $changes | ConvertTo-Json
 
-        $body = [ordered]@{
-            model           = $ModelName
-            messages        = $messages
-            response_format = @{
-                type        = "json_schema"
-                json_schema = @{
-                    name   = "CodeReviewResponse"
-                    strict = $true
-                    schema = $schema
-                }
-            }
-        } | ConvertTo-Json -Depth 10
+        $body = @"
+{"model":$modelJson,"messages":[{"role":"system","content":[{"type":"text","text":$promptJson}]},{"role":"user","content":[{"type":"text","text":$changesJson}]}],"response_format":{"type":"json_schema","json_schema":{"name":"CodeReviewResponse","strict":true,"schema":$schemaJson}}}
+"@
 
         $payloadSizeKB = [math]::Round($body.Length / 1024, 1)
         Write-Host "[Invoke-LLMCodeReview] Payload size: ${payloadSizeKB} KB ($($body.Length) chars)" -ForegroundColor Yellow
@@ -155,9 +134,9 @@ function Invoke-LLMCodeReview {
             $response = Invoke-RestMethod `
                 -Uri $ModelDeploymentUrl `
                 -Headers $headers `
-                -Body $body `
+                -Body ([System.Text.Encoding]::UTF8.GetBytes($body)) `
                 -Method Post `
-                -ContentType 'application/json' `
+                -ContentType 'application/json; charset=utf-8' `
                 -TimeoutSec $TimeoutSec
         }
         catch {
@@ -170,7 +149,11 @@ function Invoke-LLMCodeReview {
         $modelUsed = if ($ModelName -eq "model-router") { $response.model } else { $ModelName }
         Write-Host "[Invoke-LLMCodeReview] Batch $($b + 1) completed in $([math]::Round($batchStopwatch.Elapsed.TotalSeconds, 1))s (model: $modelUsed)" -ForegroundColor Green
 
-        $responseContent = $response.choices.message.content
+        $responseContent = $response.choices[0].message.content
+        if (-not $responseContent) {
+            Write-Warning "[Invoke-LLMCodeReview] Batch $($b + 1) returned empty response -- skipping"
+            continue
+        }
         Write-Host "[Invoke-LLMCodeReview] Response size: $($responseContent.Length) chars"
 
         $batchResult = $responseContent | ConvertFrom-Json
