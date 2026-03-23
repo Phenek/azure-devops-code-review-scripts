@@ -7,8 +7,9 @@ function Get-CodeChanges {
     $renamedSourceBranch = $SourceBranch -replace 'refs/heads/', 'origin/'
     $renamedTargetBranch = $TargetBranch -replace 'refs/heads/', 'origin/'
 
-    # Get changed code files only
-    $changedFiles = git diff --name-only --diff-filter=AM "$renamedTargetBranch...$renamedSourceBranch"
+    # Get changed code files only, excluding generated C# artifacts
+    $changedFiles = git diff --name-only --diff-filter=AM "$renamedTargetBranch...$renamedSourceBranch" |
+        Where-Object { $_ -notmatch '(\.Designer\.cs|Snapshot\.cs)$' }
 
     # Add legend for diff markers
     $llmOutput = @"
