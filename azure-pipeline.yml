@@ -26,9 +26,12 @@ steps:
       [string]$changes = Invoke-LLMCodeReview `
         -SourceBranch $(System.PullRequest.SourceBranch) `
         -TargetBranch $(System.PullRequest.TargetBranch) `
-        -PathToReviewFile './Generic.reviewpromtpfile.md' `
+        -PathToReviewFile './Generic.codereviewprompt.md' `
         -ModelName 'gpt-5.1-chat' `
-        -ModelDeploymentUrl 'https://<Microsoft Foundry Instance>.cognitiveservices.azure.com/openai/deployments/gpt-5.1-chat/chat/completions?api-version=2025-01-01-preview' `
+        -ModelDeploymentUrl 'https://aif-careprotech.services.ai.azure.com/api/projects/proj-careprotech/openai/v1/responses' `
+        -MaxChangesLength 30000 `
+        -RequestTimeoutSeconds 600 `
+        -MaxOutputTokens 12000 `
         -Key $(foundry-key)
 
       Set-PullRequestComments `

@@ -22,7 +22,31 @@ function Invoke-LLMCodeReview {
 
         [parameter(Mandatory)]
         [string]
-        $Key
+        $Key,
+
+        [parameter()]
+        [ValidateRange(1, 2000000)]
+        [int]
+        $MaxChangesLength = 30000,
+
+        [parameter()]
+        [ValidateRange(10, 3600)]
+        [int]
+        $RequestTimeoutSeconds = 600,
+
+        [parameter()]
+        [ValidateRange(100, 128000)]
+        [int]
+        $MaxOutputTokens = 12000,
+
+        [parameter()]
+        [ValidateRange(2000, 40000)]
+        [int]
+        $RescueMaxInputLength = 15000,
+
+        [parameter()]
+        [bool]
+        $UseJsonSchema = $false
     )
 
     $logState = [pscustomobject]@{ Step = 1 }
@@ -39,13 +63,17 @@ function Invoke-LLMCodeReview {
     }
 
     $getHttpErrorDetails = {
-        param($Exception)
+        param($Exception, $ErrorRecord)
 
         $details = [ordered]@{
             Message      = $Exception.Message
             StatusCode   = $null
             ReasonPhrase = $null
             ResponseBody = $null
+        }
+
+        if ($null -ne $ErrorRecord -and $null -ne $ErrorRecord.ErrorDetails -and -not [string]::IsNullOrWhiteSpace($ErrorRecord.ErrorDetails.Message)) {
+            $details.ResponseBody = $ErrorRecord.ErrorDetails.Message
         }
 
         $response = $Exception.Response
@@ -62,39 +90,34 @@ function Invoke-LLMCodeReview {
                 if (-not [string]::IsNullOrWhiteSpace($response.ReasonPhrase)) {
                     $details.ReasonPhrase = $response.ReasonPhrase
                 }
+                elseif (-not [string]::IsNullOrWhiteSpace($response.StatusDescription)) {
+                    $details.ReasonPhrase = $response.StatusDescription
+                }
             }
             catch {
             }
 
-            if ([string]::IsNullOrWhiteSpace($details.ReasonPhrase)) {
+            if ([string]::IsNullOrWhiteSpace($details.ResponseBody)) {
                 try {
-                    if (-not [string]::IsNullOrWhiteSpace($response.StatusDescription)) {
-                        $details.ReasonPhrase = $response.StatusDescription
+                    if ($null -ne $response.Content) {
+                        $details.ResponseBody = $response.Content.ReadAsStringAsync().GetAwaiter().GetResult()
+                    }
+                    else {
+                        $responseStream = $response.GetResponseStream()
+                        if ($null -ne $responseStream) {
+                            $reader = New-Object System.IO.StreamReader($responseStream)
+                            try {
+                                $details.ResponseBody = $reader.ReadToEnd()
+                            }
+                            finally {
+                                $reader.Dispose()
+                                $responseStream.Dispose()
+                            }
+                        }
                     }
                 }
                 catch {
                 }
-            }
-
-            try {
-                if ($null -ne $response.Content) {
-                    $details.ResponseBody = $response.Content.ReadAsStringAsync().GetAwaiter().GetResult()
-                }
-                else {
-                    $responseStream = $response.GetResponseStream()
-                    if ($null -ne $responseStream) {
-                        $reader = New-Object System.IO.StreamReader($responseStream)
-                        try {
-                            $details.ResponseBody = $reader.ReadToEnd()
-                        }
-                        finally {
-                            $reader.Dispose()
-                            $responseStream.Dispose()
-                        }
-                    }
-                }
-            }
-            catch {
             }
         }
 
@@ -111,12 +134,9 @@ function Invoke-LLMCodeReview {
         & $fail "ModelDeploymentUrl is required."
     }
 
-    $isChatCompletionsUrl = $ModelDeploymentUrl -match '/chat/completions(\?|$)'
-    $isResponsesUrl = $ModelDeploymentUrl -match '/responses(\?|$)'
-    $hasApiVersion = $ModelDeploymentUrl -match '[\?&]api-version='
-
-    if (-not ($isChatCompletionsUrl -or $isResponsesUrl) -or -not $hasApiVersion) {
-        & $fail "ModelDeploymentUrl must be a full Azure OpenAI endpoint ending with '/chat/completions' or '/responses' and include 'api-version'. Received '$ModelDeploymentUrl'."
+    $isResponsesUrl = $ModelDeploymentUrl -match '/openai/v1/responses(\?|$)|/responses(\?|$)'
+    if (-not $isResponsesUrl) {
+        & $fail "ModelDeploymentUrl must target the Responses API. Received '$ModelDeploymentUrl'."
     }
 
     if ([string]::IsNullOrWhiteSpace($Key)) {
@@ -124,163 +144,350 @@ function Invoke-LLMCodeReview {
     }
 
     $schema = @{
-        type                 = "object"
+        type                 = 'object'
         properties           = @{
             reviews = @{
-                type  = "array"
+                type  = 'array'
                 items = @{
-                    type                 = "object"
+                    type                 = 'object'
                     properties           = @{
-                        fileName   = @{
-                            type        = "string"
-                            description = "The file path being reviewed"
-                        }
-                        lineNumber = @{
-                            type        = "integer"
-                            description = "The line number where the issue occurs"
-                        }
-                        comment    = @{
-                            type        = "string"
-                            description = "The review comment with emoji, severity, category, explanation and an optional suggested fix"
-                        }
+                        fileName   = @{ type = 'string' }
+                        lineNumber = @{ type = 'integer' }
+                        comment    = @{ type = 'string' }
                     }
-                    required             = @("fileName", "lineNumber", "comment")
+                    required             = @('fileName', 'lineNumber', 'comment')
                     additionalProperties = $false
                 }
             }
         }
-        required             = @("reviews")
+        required             = @('reviews')
         additionalProperties = $false
     }
     & $logStep "Response schema prepared."
 
-    & $logStep "Collecting code changes to send to the model."
-    [string] $changes = Get-CodeChanges -SourceBranch $SourceBranch -TargetBranch $TargetBranch | Out-String
+    & $logStep "Collecting code changes."
+    [string]$changes = Get-CodeChanges -SourceBranch $SourceBranch -TargetBranch $TargetBranch | Out-String
     if ([string]::IsNullOrWhiteSpace($changes)) {
         & $fail "Get-CodeChanges returned an empty payload."
     }
-    Write-Host "[Invoke-LLMCodeReview] Code changes payload length: $($changes.Length) characters."
-    Write-Host "[Invoke-LLMCodeReview] Code changes to review:`n$changes"
 
-    # Completion text
-    & $logStep "Loading review prompt file from '$PathToReviewFile'."
-    $reviewPrompt = Get-Content -Path $PathToReviewFile -Raw
-    Write-Host "[Invoke-LLMCodeReview] Review prompt length: $($reviewPrompt.Length) characters."
-
-    $messages = @()
-    $messages += @{
-        role    = 'system'
-        content = @(
-            @{
-                type = "text"
-                text = $reviewPrompt
-            }
-        )
-    }
-    $messages += @{
-        role    = 'user'
-        content = @(
-            @{
-                type = "text"
-                text = $changes
-            }
-        )
-    }
-    & $logStep "Request messages prepared. Message count: $($messages.Count)."
-
-    # Header for authentication
-    $headers = [ordered]@{
-        "api-key" = $Key
-    }
-    & $logStep "API key header prepared."
-
-    # Adjust these values to fine-tune completions
-    & $logStep "Building request body JSON fragments."
-    $serializationStopwatch = [System.Diagnostics.Stopwatch]::StartNew()
-
-    $escapedModelName = $ModelName | ConvertTo-Json -Compress
-    $escapedReviewPrompt = $reviewPrompt | ConvertTo-Json -Compress
-    $escapedChanges = $changes | ConvertTo-Json -Compress
-    $schemaJson = $schema | ConvertTo-Json -Depth 20 -Compress
-
-    & $logStep "Assembling final request body JSON."
-    $body = @"
-{"model":$escapedModelName,"messages":[{"role":"system","content":[{"type":"text","text":$escapedReviewPrompt}]},{"role":"user","content":[{"type":"text","text":$escapedChanges}]}],"response_format":{"type":"json_schema","json_schema":{"name":"CodeReviewResponse","strict":true,"schema":$schemaJson}}}
-"@
-
-    $serializationStopwatch.Stop()
-
-    if ([string]::IsNullOrWhiteSpace($body)) {
-        & $fail "Request body serialization returned an empty payload."
+    $effectiveMaxChangesLength = $MaxChangesLength
+    if (-not [string]::IsNullOrWhiteSpace($env:LLM_REVIEW_MAX_CHANGES_LENGTH)) {
+        $parsedLength = 0
+        if ([int]::TryParse($env:LLM_REVIEW_MAX_CHANGES_LENGTH, [ref]$parsedLength) -and $parsedLength -gt 0) {
+            $effectiveMaxChangesLength = $parsedLength
+            Write-Host "[Invoke-LLMCodeReview] Using LLM_REVIEW_MAX_CHANGES_LENGTH override: $effectiveMaxChangesLength"
+        }
+        else {
+            Write-Warning "[Invoke-LLMCodeReview] Ignoring invalid LLM_REVIEW_MAX_CHANGES_LENGTH value '$($env:LLM_REVIEW_MAX_CHANGES_LENGTH)'."
+        }
     }
 
-    Write-Host "[Invoke-LLMCodeReview] Request body serialization completed in $($serializationStopwatch.ElapsedMilliseconds) ms."
-    Write-Host "[Invoke-LLMCodeReview] Request body length: $($body.Length) characters."
+    $effectiveMaxOutputTokens = $MaxOutputTokens
+    if (-not $UseJsonSchema -and $effectiveMaxOutputTokens -gt 12000) {
+        $effectiveMaxOutputTokens = 12000
+        Write-Warning "[Invoke-LLMCodeReview] MaxOutputTokens capped to $effectiveMaxOutputTokens for non-schema mode to avoid long-running free-form generations."
+    }
 
-    & $logStep "Sending request to model endpoint '$ModelDeploymentUrl'."
+    if ($changes.Length -gt $effectiveMaxChangesLength) {
+        $truncated = $changes.Substring(0, $effectiveMaxChangesLength)
+
+        # Prefer cutting at a section boundary to avoid ending in the middle of a hunk.
+        $sectionDelimiter = "`n---`n"
+        $lastSectionIndex = $truncated.LastIndexOf($sectionDelimiter)
+        if ($lastSectionIndex -gt 0 -and $lastSectionIndex -ge [int]($effectiveMaxChangesLength * 0.6)) {
+            $truncated = $truncated.Substring(0, $lastSectionIndex + $sectionDelimiter.Length)
+        }
+
+        $omittedChars = $changes.Length - $truncated.Length
+        $changes = "$truncated`n`n[TRUNCATED: $omittedChars characters omitted to fit payload budget]"
+        Write-Warning "[Invoke-LLMCodeReview] Changes payload is large ($($changes.Length + $omittedChars)). Truncated to $($changes.Length) characters."
+    }
+
+    $effectiveRequestTimeoutSeconds = $RequestTimeoutSeconds
+    if (-not [string]::IsNullOrWhiteSpace($env:LLM_REVIEW_TIMEOUT_SECONDS)) {
+        $parsedTimeoutSeconds = 0
+        if ([int]::TryParse($env:LLM_REVIEW_TIMEOUT_SECONDS, [ref]$parsedTimeoutSeconds) -and $parsedTimeoutSeconds -ge 10 -and $parsedTimeoutSeconds -le 3600) {
+            $effectiveRequestTimeoutSeconds = $parsedTimeoutSeconds
+            Write-Host "[Invoke-LLMCodeReview] Using LLM_REVIEW_TIMEOUT_SECONDS override: $effectiveRequestTimeoutSeconds"
+        }
+        else {
+            Write-Warning "[Invoke-LLMCodeReview] Ignoring invalid LLM_REVIEW_TIMEOUT_SECONDS value '$($env:LLM_REVIEW_TIMEOUT_SECONDS)'."
+        }
+    }
+
+    & $logStep "Loading review prompt from '$PathToReviewFile'."
+    $reviewPrompt = Get-Content -Path $PathToReviewFile -Raw -Encoding UTF8
+    if ([string]::IsNullOrWhiteSpace($reviewPrompt)) {
+        & $fail "Review prompt file is empty."
+    }
+
+    & $logStep "Building request payload."
+
+    & $logStep "Serializing request JSON."
+    $serializeSw = [System.Diagnostics.Stopwatch]::StartNew()
     try {
-        $response = Invoke-RestMethod `
-            -Uri $ModelDeploymentUrl `
-            -Headers $headers `
-            -Body $body `
-            -Method Post `
-            -ContentType 'application/json' `
-            -ErrorAction Stop
+        Write-Host "[Invoke-LLMCodeReview] Using manual JSON payload serialization (no ConvertTo-Json on large payload)."
+
+        $encodeJsonString = {
+            param([AllowNull()][string]$Value)
+            if ($null -eq $Value) {
+                return ''
+            }
+
+            # JSON-safe string escaping with minimal overhead.
+            return [System.Text.Encodings.Web.JavaScriptEncoder]::Default.Encode($Value)
+        }
+
+        $modelEscaped = & $encodeJsonString $ModelName
+        $instructionsEscaped = & $encodeJsonString $reviewPrompt
+        $inputEscaped = & $encodeJsonString $changes
+
+        # Static schema avoids heavy object graph serialization.
+        $schemaJson = '{"type":"object","properties":{"reviews":{"type":"array","items":{"type":"object","properties":{"fileName":{"type":"string"},"lineNumber":{"type":"integer"},"comment":{"type":"string"}},"required":["fileName","lineNumber","comment"],"additionalProperties":false}}},"required":["reviews"],"additionalProperties":false}'
+
+        $bodyWithSchema = '{"model":"' + $modelEscaped + '","instructions":"' + $instructionsEscaped + '","input":"' + $inputEscaped + '","tools":[{"type":"function","name":"submit_code_review","description":"Return code review findings in the required schema.","parameters":' + $schemaJson + ',"strict":true}],"tool_choice":{"type":"function","name":"submit_code_review"},"max_output_tokens":' + $effectiveMaxOutputTokens + ',"truncation":"auto","store":false}'
+        $bodyWithoutSchema = '{"model":"' + $modelEscaped + '","instructions":"' + $instructionsEscaped + '","input":"' + $inputEscaped + '","text":{"format":{"type":"text"}},"max_output_tokens":' + $effectiveMaxOutputTokens + ',"truncation":"auto","store":false}'
+
+        if ($UseJsonSchema) {
+            $body = $bodyWithSchema
+        }
+        else {
+            $body = $bodyWithoutSchema
+        }
     }
     catch {
-        $httpError = & $getHttpErrorDetails $_.Exception
-        Write-Error "[Invoke-LLMCodeReview] HTTP request failed. StatusCode=$($httpError.StatusCode) Reason='$($httpError.ReasonPhrase)' Message='$($httpError.Message)'"
+        Write-Error "[Invoke-LLMCodeReview] Request payload serialization failed: $($_.Exception.Message)"
+        Write-Host "[Invoke-LLMCodeReview] ScriptStackTrace: $($_.ScriptStackTrace)"
+        throw
+    }
+    finally {
+        $serializeSw.Stop()
+        Write-Host "[Invoke-LLMCodeReview] Serialization duration: $($serializeSw.ElapsedMilliseconds) ms"
+    }
+
+    if ([string]::IsNullOrWhiteSpace($body)) {
+        & $fail "Serialized request body is empty."
+    }
+
+    $bodyByteLength = [System.Text.Encoding]::UTF8.GetByteCount($body)
+    Write-Host "[Invoke-LLMCodeReview] Serialized payload length: $($body.Length) characters, $bodyByteLength bytes."
+    Write-Host "[Invoke-LLMCodeReview] Request diagnostics: Model='$ModelName', InputLength=$($changes.Length), PromptLength=$($reviewPrompt.Length), MaxOutputTokens=$effectiveMaxOutputTokens, UseJsonSchema=$UseJsonSchema."
+
+    & $logStep "Sending request to model endpoint."
+    $invokeResponsesRequest = {
+        param(
+            [Parameter(Mandatory)]
+            [string]$RequestBody,
+
+            [Parameter(Mandatory)]
+            [string]$AttemptName
+        )
+
+        $attemptByteLength = [System.Text.Encoding]::UTF8.GetByteCount($RequestBody)
+        Write-Host "[Invoke-LLMCodeReview] Sending attempt '$AttemptName' (PayloadBytes=$attemptByteLength, TimeoutSeconds=$effectiveRequestTimeoutSeconds)."
+
+        $handler = New-Object System.Net.Http.HttpClientHandler
+        $handler.UseProxy = $false
+        $httpClient = New-Object System.Net.Http.HttpClient($handler)
+        try {
+            $httpClient.Timeout = [TimeSpan]::FromSeconds($effectiveRequestTimeoutSeconds)
+            $request = New-Object System.Net.Http.HttpRequestMessage([System.Net.Http.HttpMethod]::Post, $ModelDeploymentUrl)
+            try {
+                $request.Headers.Add('api-key', $Key)
+                $request.Headers.Accept.Clear()
+                $request.Headers.Accept.Add([System.Net.Http.Headers.MediaTypeWithQualityHeaderValue]::new('application/json'))
+                $request.Headers.ExpectContinue = $false
+                $request.Version = [Version]::new(1, 1)
+                $request.Content = New-Object System.Net.Http.StringContent($RequestBody, [System.Text.Encoding]::UTF8, 'application/json')
+
+                $sendSw = [System.Diagnostics.Stopwatch]::StartNew()
+                Write-Host "[Invoke-LLMCodeReview] Attempt '$AttemptName': opening HTTP connection and sending request body."
+                $rawHttpResponse = $httpClient.SendAsync($request, [System.Net.Http.HttpCompletionOption]::ResponseHeadersRead).GetAwaiter().GetResult()
+                $sendSw.Stop()
+                Write-Host "[Invoke-LLMCodeReview] Attempt '$AttemptName': received response headers in $($sendSw.ElapsedMilliseconds) ms (StatusCode=$([int]$rawHttpResponse.StatusCode))."
+
+                $readSw = [System.Diagnostics.Stopwatch]::StartNew()
+                $responseBodyText = $rawHttpResponse.Content.ReadAsStringAsync().GetAwaiter().GetResult()
+                $readSw.Stop()
+                Write-Host "[Invoke-LLMCodeReview] Attempt '$AttemptName': response body read in $($readSw.ElapsedMilliseconds) ms."
+
+                [pscustomobject]@{
+                    IsSuccessStatusCode = $rawHttpResponse.IsSuccessStatusCode
+                    StatusCode          = [int]$rawHttpResponse.StatusCode
+                    ReasonPhrase        = $rawHttpResponse.ReasonPhrase
+                    ResponseBody        = $responseBodyText
+                    AttemptName         = $AttemptName
+                }
+            }
+            finally {
+                if ($null -ne $request) {
+                    $request.Dispose()
+                }
+            }
+        }
+        finally {
+            $httpClient.Dispose()
+            $handler.Dispose()
+        }
+    }
+
+    try {
+        if ($UseJsonSchema) {
+            $requestResult = & $invokeResponsesRequest -RequestBody $bodyWithSchema -AttemptName 'with_json_schema'
+
+            if (-not $requestResult.IsSuccessStatusCode -and $requestResult.StatusCode -eq 400) {
+                Write-Warning "[Invoke-LLMCodeReview] Attempt '$($requestResult.AttemptName)' returned 400. This endpoint/model may reject strict structured output for this request shape."
+            }
+        }
+        else {
+            $requestResult = & $invokeResponsesRequest -RequestBody $bodyWithoutSchema -AttemptName 'without_json_schema'
+        }
+
+        if (-not $requestResult.IsSuccessStatusCode) {
+            Write-Error "[Invoke-LLMCodeReview] Request failed. StatusCode=$($requestResult.StatusCode) Reason='$($requestResult.ReasonPhrase)' Attempt='$($requestResult.AttemptName)'"
+            if (-not [string]::IsNullOrWhiteSpace($requestResult.ResponseBody)) {
+                Write-Host "[Invoke-LLMCodeReview] Request error body:`n$($requestResult.ResponseBody)"
+            }
+
+            if ($requestResult.StatusCode -eq 400 -and -not [string]::IsNullOrWhiteSpace($requestResult.ResponseBody)) {
+                if ($requestResult.ResponseBody -match 'max_output_tokens|maximum|too large|invalid_request_error') {
+                    & $fail "Model endpoint returned HTTP 400 on attempt '$($requestResult.AttemptName)'. Request was rejected; try lowering MaxOutputTokens (current=$effectiveMaxOutputTokens)."
+                }
+            }
+
+            & $fail "Model endpoint returned HTTP $($requestResult.StatusCode) on attempt '$($requestResult.AttemptName)'."
+        }
+
+        $response = $requestResult.ResponseBody
+
+    }
+    catch {
+        $errorMessage = [string]$_.Exception.Message
+        if ($errorMessage.StartsWith('[Invoke-LLMCodeReview] Model endpoint returned HTTP', [System.StringComparison]::Ordinal) -or $errorMessage.StartsWith('[Invoke-LLMCodeReview] Request failed.', [System.StringComparison]::Ordinal)) {
+            throw
+        }
+
+        if ($_.Exception -is [System.Threading.Tasks.TaskCanceledException] -or $_.Exception -is [System.OperationCanceledException] -or $_.Exception -is [System.TimeoutException]) {
+            & $fail "Request timed out after $effectiveRequestTimeoutSeconds second(s) while contacting model endpoint before a response was received. Model='$ModelName', MaxOutputTokens='$effectiveMaxOutputTokens', UseJsonSchema='$UseJsonSchema'."
+        }
+
+        $httpError = & $getHttpErrorDetails $_.Exception $_
+        Write-Error "[Invoke-LLMCodeReview] Request failed. StatusCode=$($httpError.StatusCode) Reason='$($httpError.ReasonPhrase)' Message='$($httpError.Message)'"
         if (-not [string]::IsNullOrWhiteSpace($httpError.ResponseBody)) {
-            Write-Host "[Invoke-LLMCodeReview] HTTP error response body:`n$($httpError.ResponseBody)"
+            Write-Host "[Invoke-LLMCodeReview] Request error body:`n$($httpError.ResponseBody)"
         }
         throw
     }
+
     & $logStep "Received response from model endpoint."
 
-    Write-Host "[Invoke-LLMCodeReview] Raw response type: $($response.GetType().FullName)"
-
     if ($response -is [string]) {
-        if ([string]::IsNullOrWhiteSpace($response)) {
-            & $fail "Model endpoint returned an empty string response. Verify ModelDeploymentUrl points to the full Azure OpenAI API path, not only the resource root."
-        }
-
         try {
             $response = $response | ConvertFrom-Json -ErrorAction Stop
-            Write-Host "[Invoke-LLMCodeReview] Parsed string response into JSON object."
         }
         catch {
-            Write-Host "[Invoke-LLMCodeReview] Raw string response:`n$response"
-            & $fail "Model endpoint returned a non-JSON string response. Verify ModelDeploymentUrl and API compatibility."
+            Write-Host "[Invoke-LLMCodeReview] Raw response:`n$response"
+            & $fail "Model returned a non-JSON string response."
         }
     }
 
     $responseContent = $null
-    if ($null -ne $response.choices -and $response.choices.Count -gt 0) {
-        $responseContent = $response.choices[0].message.content
+
+    if ($UseJsonSchema -and $null -ne $response.output) {
+        foreach ($outputItem in $response.output) {
+            if ($outputItem.type -eq 'function_call' -and $outputItem.name -eq 'submit_code_review' -and -not [string]::IsNullOrWhiteSpace($outputItem.arguments)) {
+                $responseContent = $outputItem.arguments
+                break
+            }
+        }
     }
-    elseif ($null -ne $response.message) {
-        $responseContent = $response.message.content
-    }
-    elseif ($null -ne $response.output_text) {
+
+    if ([string]::IsNullOrWhiteSpace($responseContent) -and -not [string]::IsNullOrWhiteSpace($response.output_text)) {
         $responseContent = $response.output_text
     }
+    elseif ([string]::IsNullOrWhiteSpace($responseContent) -and $null -ne $response.output) {
+        $parts = @()
+        foreach ($outputItem in $response.output) {
+            if ($outputItem.type -ne 'message' -or $null -eq $outputItem.content) {
+                continue
+            }
 
-    if ($null -eq $responseContent) {
-        Write-Warning "[Invoke-LLMCodeReview] Unable to extract response content from model response."
-        Write-Host ($response | ConvertTo-Json -Depth 20)
-        & $fail "Model response did not contain message content in an expected location."
+            foreach ($contentItem in $outputItem.content) {
+                if ($contentItem.type -eq 'output_text' -and -not [string]::IsNullOrWhiteSpace($contentItem.text)) {
+                    $parts += $contentItem.text
+                }
+            }
+        }
+
+        if ($parts.Count -gt 0) {
+            $responseContent = $parts -join "`n"
+        }
     }
 
+    if ([string]::IsNullOrWhiteSpace($responseContent)) {
+        try {
+            if ($response.status -eq 'incomplete' -and $null -ne $response.incomplete_details -and -not [string]::IsNullOrWhiteSpace($response.incomplete_details.reason)) {
+                $usageOutputTokens = $null
+                $usageReasoningTokens = $null
+                $responseReasoningEffort = $null
+                $responseTextFormatType = $null
+                $responseTextVerbosity = $null
 
-    if ($ModelName -eq "model-router") {
-        Write-Host "Response from $ModelName using $($response.model):"
-        Write-Host ($responseContent | ConvertTo-Json)
-    } else {
-        Write-Host "Response from $($ModelName):"
-        Write-Host ($responseContent | ConvertTo-Json)
+                if ($null -ne $response.usage) {
+                    $usageOutputTokens = $response.usage.output_tokens
+                    if ($null -ne $response.usage.output_tokens_details) {
+                        $usageReasoningTokens = $response.usage.output_tokens_details.reasoning_tokens
+                    }
+                }
+
+                if ($null -ne $response.reasoning) {
+                    $responseReasoningEffort = $response.reasoning.effort
+                }
+
+                if ($null -ne $response.text) {
+                    if ($null -ne $response.text.format) {
+                        $responseTextFormatType = $response.text.format.type
+                    }
+
+                    $responseTextVerbosity = $response.text.verbosity
+                }
+
+                if ($response.incomplete_details.reason -eq 'max_output_tokens' -and $null -ne $usageOutputTokens -and $null -ne $usageReasoningTokens -and $usageOutputTokens -eq $usageReasoningTokens -and $usageOutputTokens -gt 0) {
+                    & $fail "Model response exhausted max_output_tokens using reasoning only and produced no assistant message. usage.output_tokens='$usageOutputTokens', usage.reasoning_tokens='$usageReasoningTokens', response.reasoning.effort='$responseReasoningEffort', response.text.format='$responseTextFormatType', response.text.verbosity='$responseTextVerbosity', MaxOutputTokens='$effectiveMaxOutputTokens', UseJsonSchema='$UseJsonSchema'."
+                }
+
+                & $fail "Model response is incomplete (reason='$($response.incomplete_details.reason)') and contains no output_text. usage.output_tokens='$usageOutputTokens', usage.reasoning_tokens='$usageReasoningTokens', response.reasoning.effort='$responseReasoningEffort', response.text.format='$responseTextFormatType', response.text.verbosity='$responseTextVerbosity', MaxOutputTokens='$effectiveMaxOutputTokens'."
+            }
+        }
+        catch {
+        }
+
+        Write-Host "[Invoke-LLMCodeReview] Raw response JSON:`n$($response | ConvertTo-Json -Depth 20)"
+        & $fail "No extractable response content found."
     }
+
+    try {
+        $normalizedResponseContent = $responseContent.Trim()
+        if ($normalizedResponseContent -match '^```(?:json)?\s*([\s\S]*?)\s*```$') {
+            $normalizedResponseContent = $matches[1].Trim()
+        }
+
+        $reviewsObject = $normalizedResponseContent | ConvertFrom-Json -ErrorAction Stop
+    }
+    catch {
+        Write-Host "[Invoke-LLMCodeReview] Raw response content:`n$responseContent"
+        & $fail "Response content is not valid JSON."
+    }
+
+    if ($null -eq $reviewsObject.reviews) {
+        Write-Host "[Invoke-LLMCodeReview] Parsed response object:`n$($reviewsObject | ConvertTo-Json -Depth 20)"
+        & $fail "Response JSON does not include top-level 'reviews'."
+    }
+
+    $normalizedResponse = $reviewsObject | ConvertTo-Json -Depth 20 -Compress
 
     & $logStep "Returning parsed response content."
 
-    return $responseContent
+    return $normalizedResponse
 }

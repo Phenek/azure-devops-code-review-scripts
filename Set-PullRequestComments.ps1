@@ -253,15 +253,63 @@ function Set-PullRequestComments {
         return
     }
 
-    # Filter out duplicate reviews
-    & $logStep "Filtering duplicate review comments."
-    $newReviews = $reviewsObject.reviews | Where-Object {
-        # Normalize file path
-        $normalizedPath = $_.fileName.ToLower()
+    & $logStep "Validating and normalizing review items."
+    $validReviews = @()
+    $generalReviews = @()
+    $invalidReviewsCount = 0
+    foreach ($review in $reviewsObject.reviews) {
+        if ($review -is [string]) {
+            if (-not [string]::IsNullOrWhiteSpace($review)) {
+                $generalReviews += [pscustomobject]@{ comment = [string]$review }
+            }
+            else {
+                $invalidReviewsCount++
+            }
+            continue
+        }
+
+        $hasFileName = $null -ne $review -and -not [string]::IsNullOrWhiteSpace($review.fileName)
+        $hasLineNumber = $null -ne $review -and $null -ne $review.lineNumber -and ($review.lineNumber -as [int]) -gt 0
+        $hasComment = $null -ne $review -and -not [string]::IsNullOrWhiteSpace($review.comment)
+
+        if (-not $hasComment) {
+            $invalidReviewsCount++
+            Write-Warning "[Set-PullRequestComments] Skipping invalid review item. fileName='$($review.fileName)' lineNumber='$($review.lineNumber)' hasComment=$hasComment"
+            continue
+        }
+
+        if (-not $hasFileName -or -not $hasLineNumber) {
+            # Keep comment as a general PR thread when line context is unavailable.
+            $generalReviews += [pscustomobject]@{ comment = [string]$review.comment }
+            continue
+        }
+
+        $normalizedPath = $review.fileName.Trim().ToLower()
         if (-not $normalizedPath.StartsWith('/')) {
             $normalizedPath = "/$normalizedPath"
         }
-        $key = "$normalizedPath|$($_.lineNumber)"
+
+        $validReviews += [pscustomobject]@{
+            fileName = $normalizedPath
+            lineNumber = [int]$review.lineNumber
+            comment = [string]$review.comment
+        }
+    }
+
+    if ($invalidReviewsCount -gt 0) {
+        Write-Warning "[Set-PullRequestComments] Ignored $invalidReviewsCount invalid review item(s)."
+    }
+
+    if ($validReviews.Count -eq 0 -and $generalReviews.Count -eq 0) {
+        & $logStep "Stopping because there are no valid reviews to publish."
+        Write-Host "No valid reviews to post after validation."
+        return
+    }
+
+    # Filter out duplicate reviews
+    & $logStep "Filtering duplicate review comments."
+    $newReviews = $validReviews | Where-Object {
+        $key = "$($_.fileName)|$($_.lineNumber)"
 
         # Keep only reviews that don't exist yet
         -not $existingComments.ContainsKey($key)
@@ -269,12 +317,14 @@ function Set-PullRequestComments {
     Write-Host "[Set-PullRequestComments] $($newReviews.Count) new review(s) remain after duplicate filtering."
 
     if ($newReviews.Count -eq 0) {
-        Write-Host "All comments already exist. No new comments to post." -ForegroundColor Yellow
-        & $logStep "Stopping because every review already exists on the pull request."
-        return
+        if ($generalReviews.Count -eq 0) {
+            Write-Host "All comments already exist. No new comments to post." -ForegroundColor Yellow
+            & $logStep "Stopping because every review already exists on the pull request."
+            return
+        }
     }
 
-    $skipped = $reviewsObject.reviews.Count - $newReviews.Count
+    $skipped = $validReviews.Count - $newReviews.Count
     if ($skipped -gt 0) {
         Write-Host "Skipping $skipped duplicate comment(s)" -ForegroundColor Yellow
     }
@@ -320,6 +370,35 @@ function Set-PullRequestComments {
                 Write-Host "[Set-PullRequestComments] HTTP error response body:`n$($httpError.ResponseBody)"
             }
             $failedPosts += "'$($review.fileName)' line $($review.lineNumber)"
+        }
+    }
+
+    if ($generalReviews.Count -gt 0) {
+        Write-Host "[Set-PullRequestComments] Posting $($generalReviews.Count) general review comment(s) without file/line context."
+        foreach ($generalReview in $generalReviews) {
+            $threadBody = @{
+                comments = @(
+                    @{
+                        parentCommentId = 0
+                        content         = $generalReview.comment
+                        commentType     = 1
+                    }
+                )
+                status   = 1
+            }
+
+            try {
+                $response = Invoke-RestMethod -Uri $createThreadUrl -Headers $headers -Method Post -Body ($threadBody | ConvertTo-Json -Depth 10) -ErrorAction Stop
+                Write-Host "General comment posted (Thread ID: $($response.id))" -ForegroundColor Green
+            }
+            catch {
+                $httpError = & $getHttpErrorDetails $_.Exception
+                Write-Error "[Set-PullRequestComments] Failed to post general comment. StatusCode=$($httpError.StatusCode) Reason='$($httpError.ReasonPhrase)' Message='$($httpError.Message)'"
+                if (-not [string]::IsNullOrWhiteSpace($httpError.ResponseBody)) {
+                    Write-Host "[Set-PullRequestComments] HTTP error response body:`n$($httpError.ResponseBody)"
+                }
+                $failedPosts += "general comment"
+            }
         }
     }
 
