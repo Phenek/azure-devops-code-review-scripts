@@ -25,11 +25,11 @@ function Invoke-LLMCodeReview {
         $Key
     )
 
-    $step = 1
+    $logState = [pscustomobject]@{ Step = 1 }
     $logStep = {
         param([string]$Message)
-        Write-Host "[Invoke-LLMCodeReview][Step $step] $Message"
-        $step++
+        Write-Host "[Invoke-LLMCodeReview][Step $($logState.Step)] $Message"
+        $logState.Step++
     }
 
     $fail = {
@@ -182,9 +182,9 @@ function Invoke-LLMCodeReview {
 
     # Header for authentication
     $headers = [ordered]@{
-        "Authorization" = "Bearer $($Key)"
+        "api-key" = $Key
     }
-    & $logStep "Authorization header prepared."
+    & $logStep "API key header prepared."
 
     # Adjust these values to fine-tune completions
     $body = [ordered]@{

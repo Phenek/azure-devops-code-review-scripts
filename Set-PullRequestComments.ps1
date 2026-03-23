@@ -25,11 +25,11 @@ function Set-PullRequestComments {
         $AutoApprove
     )
 
-    $step = 1
+    $logState = [pscustomobject]@{ Step = 1 }
     $logStep = {
         param([string]$Message)
-        Write-Host "[Set-PullRequestComments][Step $step] $Message"
-        $step++
+        Write-Host "[Set-PullRequestComments][Step $($logState.Step)] $Message"
+        $logState.Step++
     }
 
     $fail = {

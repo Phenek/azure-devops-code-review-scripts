@@ -4,11 +4,11 @@ function Get-CodeChanges {
         [string]$SourceBranch
     )
 
-    $step = 1
+    $logState = [pscustomobject]@{ Step = 1 }
     $logStep = {
         param([string]$Message)
-        Write-Host "[Get-CodeChanges][Step $step] $Message"
-        $step++
+        Write-Host "[Get-CodeChanges][Step $($logState.Step)] $Message"
+        $logState.Step++
     }
 
     $fail = {
