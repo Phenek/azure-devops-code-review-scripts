@@ -111,6 +111,14 @@ function Invoke-LLMCodeReview {
         & $fail "ModelDeploymentUrl is required."
     }
 
+    $isChatCompletionsUrl = $ModelDeploymentUrl -match '/chat/completions(\?|$)'
+    $isResponsesUrl = $ModelDeploymentUrl -match '/responses(\?|$)'
+    $hasApiVersion = $ModelDeploymentUrl -match '[\?&]api-version='
+
+    if (-not ($isChatCompletionsUrl -or $isResponsesUrl) -or -not $hasApiVersion) {
+        & $fail "ModelDeploymentUrl must be a full Azure OpenAI endpoint ending with '/chat/completions' or '/responses' and include 'api-version'. Received '$ModelDeploymentUrl'."
+    }
+
     if ([string]::IsNullOrWhiteSpace($Key)) {
         & $fail "Key is required."
     }
@@ -187,18 +195,26 @@ function Invoke-LLMCodeReview {
     & $logStep "API key header prepared."
 
     # Adjust these values to fine-tune completions
-    $body = [ordered]@{
-        model           = $ModelName
-        messages        = $messages
-        response_format = @{
-            type        = "json_schema"
-            json_schema = @{
-                name   = "CodeReviewResponse" # A required property
-                strict = $true # Recommended for structured outputs
-                schema = $schema # The JSON schema that defines the expected response structure
-            }
-        }
-    } | ConvertTo-Json -Depth 99
+    & $logStep "Building request body JSON fragments."
+    $serializationStopwatch = [System.Diagnostics.Stopwatch]::StartNew()
+
+    $escapedModelName = $ModelName | ConvertTo-Json -Compress
+    $escapedReviewPrompt = $reviewPrompt | ConvertTo-Json -Compress
+    $escapedChanges = $changes | ConvertTo-Json -Compress
+    $schemaJson = $schema | ConvertTo-Json -Depth 20 -Compress
+
+    & $logStep "Assembling final request body JSON."
+    $body = @"
+{"model":$escapedModelName,"messages":[{"role":"system","content":[{"type":"text","text":$escapedReviewPrompt}]},{"role":"user","content":[{"type":"text","text":$escapedChanges}]}],"response_format":{"type":"json_schema","json_schema":{"name":"CodeReviewResponse","strict":true,"schema":$schemaJson}}}
+"@
+
+    $serializationStopwatch.Stop()
+
+    if ([string]::IsNullOrWhiteSpace($body)) {
+        & $fail "Request body serialization returned an empty payload."
+    }
+
+    Write-Host "[Invoke-LLMCodeReview] Request body serialization completed in $($serializationStopwatch.ElapsedMilliseconds) ms."
     Write-Host "[Invoke-LLMCodeReview] Request body length: $($body.Length) characters."
 
     & $logStep "Sending request to model endpoint '$ModelDeploymentUrl'."
@@ -221,12 +237,32 @@ function Invoke-LLMCodeReview {
     }
     & $logStep "Received response from model endpoint."
 
+    Write-Host "[Invoke-LLMCodeReview] Raw response type: $($response.GetType().FullName)"
+
+    if ($response -is [string]) {
+        if ([string]::IsNullOrWhiteSpace($response)) {
+            & $fail "Model endpoint returned an empty string response. Verify ModelDeploymentUrl points to the full Azure OpenAI API path, not only the resource root."
+        }
+
+        try {
+            $response = $response | ConvertFrom-Json -ErrorAction Stop
+            Write-Host "[Invoke-LLMCodeReview] Parsed string response into JSON object."
+        }
+        catch {
+            Write-Host "[Invoke-LLMCodeReview] Raw string response:`n$response"
+            & $fail "Model endpoint returned a non-JSON string response. Verify ModelDeploymentUrl and API compatibility."
+        }
+    }
+
     $responseContent = $null
     if ($null -ne $response.choices -and $response.choices.Count -gt 0) {
         $responseContent = $response.choices[0].message.content
     }
     elseif ($null -ne $response.message) {
         $responseContent = $response.message.content
+    }
+    elseif ($null -ne $response.output_text) {
+        $responseContent = $response.output_text
     }
 
     if ($null -eq $responseContent) {
